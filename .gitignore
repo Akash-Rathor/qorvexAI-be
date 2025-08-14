@@ -1,0 +1,16 @@
+.venv/
+models/
+__pycache__/
+*.pyc
+.vscode/
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+*.env
+*.DS_Store
+*.egg-info/
+*.egg
+*.coverage
+.coverage.*
