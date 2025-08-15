@@ -4,6 +4,8 @@ import time
 from PIL import Image
 import numpy as np
 from transformers import TextIteratorStreamer
+import re
+
 
 def preprocess_images(frames, size=(224, 224)):
     """Convert frames (numpy arrays or PIL) to resized PIL images"""
@@ -27,12 +29,33 @@ def build_prompt(prompt, num_images=0):
         image_tokens += "<start_of_image>\n"
 
     return f"""
-    <start_of_turn>system
-    You are a helpful assistant. Always respond in English.<end_of_turn>
     <start_of_turn>user
-    {image_tokens}{prompt}<end_of_turn>
+    {image_tokens}
+    \n{prompt}
+    You are a helpful assistant.
+    Always respond by analysing the screen image shared and response should be related to screen frame only.
+    Always respond in English.
+    <end_of_turn>
     <start_of_turn>model
     """
+
+def filter_queue(text_data):
+    # Implement your filtering logic here
+    unwanted_outputs = (
+                        "d and response should be related to screen frame only.\n    Always respond in English.\n    \n    model\n    ",
+                        )
+    if text_data in unwanted_outputs:
+        return None
+    if text_data == "<end_of_turn>":
+        return None
+
+    for sent in unwanted_outputs:
+        if text_data.endswith(sent):
+            return None
+
+    # result = re.sub(r'data:', '', text_data)
+
+    return text_data
 
 def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
     output_q = queue.Queue()
@@ -83,7 +106,10 @@ def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
 
         # Yield streamed tokens
         for text_piece in streamer:
-            output_q.put(text_piece)
+            text_piece = filter_queue(text_piece)
+            if text_piece:
+                print(f"{text_piece}",end=" ")
+                output_q.put(text_piece)
 
     threading.Thread(target=_generate, daemon=True).start()
 
