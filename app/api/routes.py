@@ -22,6 +22,7 @@ def ping():
 
 
 # @router.post("/generate")
+#  # this function is to work with guff
 # async def generate(request: PredictRequest, access=Depends(access_model_instance)):
 #     session_id = request.session_id
 #     prompt = request.prompt
@@ -53,31 +54,108 @@ def ping():
 
 @router.post("/generate")
 async def generate(request: PredictRequest, access=Depends(access_model_instance)):
-    session_id = request.session_id
-    prompt = request.prompt
-    model = access.get("model")
+    try:
+        session_id = request.session_id
+        prompt = request.prompt
+        max_tokens = request.max_tokens
+        access_model = access.get("model")
+        model = access_model
 
-    if not session_id or session_id not in frame_memory:
-        return JSONResponse({"error": "Invalid session_id or session not active"}, status_code=400)
+        if not session_id or session_id not in frame_memory:
+            return JSONResponse({"error": "Invalid session_id or session not active"}, status_code=400)
 
-    q = frame_memory[session_id]["queue"]
+        q = frame_memory[session_id]["queue"]
 
-    # Collect latest frames
-    frames = []
-    with frame_memory[session_id]["lock"]:
-        while not q.empty():
-            item = q.get()
-            frames.append(item["frame"] if isinstance(item, dict) else item)
+        # Safely collect latest frames
+        frames = []
+        with frame_memory[session_id]["lock"]:
+            frame_count = 0
+            while not q.empty() and frame_count < 3:
+                try:
+                    item = q.get_nowait()
+                    frames.append(item["frame"] if isinstance(item, dict) else item)
+                    frame_count += 1
+                except queue.Empty:
+                    break
 
-    frames = frames[-3:] if frames else None  # Last 3 frames
+        def token_generator():
+            output_q = queue.Queue()
+            stop_event = threading.Event()
 
-    def token_generator():
-        for token in model.generate_stream(prompt, frames=frames, max_tokens=500):
-            yield token
+            def _generate():
+                try:
+                    # Initial generation with current frames
+                    pil_imgs = []
+                    if frames:
+                        for f in frames:
+                            if isinstance(f, np.ndarray):
+                                pil_imgs.append(Image.fromarray(f))
 
-    return StreamingResponse(token_generator(), media_type="text/plain")
+                    # Generate initial response
+                    for token in generate_stream(model,prompt, frame_queue=pil_imgs):
+                        if stop_event.is_set():
+                            break
+                        output_q.put(token)
 
+                    # Continue processing new frames
+                    while not stop_event.is_set():
+                        if session_id not in frame_memory:
+                            break
 
+                        # Get new frames safely
+                        latest_frames = []
+                        q_local = frame_memory[session_id]["queue"]
+                        with frame_memory[session_id]["lock"]:
+                            try:
+                                while not q_local.empty():
+                                    f = q_local.get_nowait()
+                                    latest_frames.append(f["frame"] if isinstance(f, dict) else f)
+                            except queue.Empty:
+                                pass
+
+                        if latest_frames:
+                            pil_imgs = [Image.fromarray(f) for f in latest_frames]
+                            try:
+                                for token in generate_stream(model,prompt, frame_queue=pil_imgs):
+                                    if stop_event.is_set():
+                                        break
+                                    output_q.put(token)
+                            except Exception as e:
+                                output_q.put(f"[Generation Error]: {str(e)}")
+
+                        time.sleep(0.3)  # Adjust based on your needs
+
+                except Exception as e:
+                    output_q.put(f"[Error during generation]: {str(e)}")
+                finally:
+                    output_q.put(None)  # Signal end of stream
+
+            # Start generation thread
+            generation_thread = threading.Thread(target=_generate, daemon=True)
+            generation_thread.start()
+
+            # Stream tokens
+            try:
+                while True:
+                    try:
+                        token = output_q.get(timeout=30)  # 30-second timeout
+                        if token is None:
+                            break
+                        yield f"data: {token}\n\n"  # SSE format
+                    except queue.Empty:
+                        stop_event.set()
+                        yield "data: [Stream timeout]\n\n"
+                        break
+            except Exception as e:
+                stop_event.set()
+                yield f"data: [Stream error]: {str(e)}\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(token_generator(), media_type="text/plain")
+
+    except Exception as e:
+        return JSONResponse({"error": f"Generation failed: {str(e)}"}, status_code=500)
 
 
 
@@ -86,6 +164,7 @@ async def stream_frame(ws: WebSocket, session_id: str):
     session_id = session_id.strip()
     await ws.accept()
     
+    # Initialize session memory
     frame_memory.setdefault(session_id, {
         "queue": queue.Queue(maxsize=MAX_FRAMES),
         "lock": threading.Lock()
@@ -95,7 +174,6 @@ async def stream_frame(ws: WebSocket, session_id: str):
 
     try:
         while True:
-            # Wait for incoming message (text or binary)
             msg = await ws.receive()
 
             if msg.get("type") == "websocket.disconnect":
@@ -103,40 +181,49 @@ async def stream_frame(ws: WebSocket, session_id: str):
                 break
 
             if "bytes" in msg and msg["bytes"] is not None:
-                # Frame data
-                nparr = np.frombuffer(msg["bytes"], np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                # Process frame data
+                try:
+                    nparr = np.frombuffer(msg["bytes"], np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                if frame is None:
-                    print(f"[{session_id}] Failed to decode frame")
-                    continue
+                    if frame is None:
+                        print(f"[{session_id}] Failed to decode frame")
+                        continue
 
-                # Resize to avoid heavy processing
-                frame_resized = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_AREA)
+                    # Resize frame for processing
+                    frame_resized = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_AREA)
+                    
+                    # Convert BGR to RGB for PIL compatibility
+                    frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
-                # Store frame
-                q = frame_memory[session_id]["queue"]
-                with frame_memory[session_id]["lock"]:
-                    if q.full():
-                        _ = q.get_nowait()
-                    q.put_nowait({"frame": frame_resized, "timestamp": time.time()})
-                    # print(f"[{session_id}] Frame stored. Queue size: {q.qsize()}")
+                    # Store frame safely
+                    q = frame_memory[session_id]["queue"]
+                    with frame_memory[session_id]["lock"]:
+                        if q.full():
+                            # Remove oldest frame if queue is full
+                            try:
+                                _ = q.get_nowait()
+                            except queue.Empty:
+                                pass
+                        q.put_nowait({"frame": frame_rgb, "timestamp": time.time()})
 
-                # Optional: ack
-                # await ws.send_text("frame_received")
+                except Exception as e:
+                    print(f"[{session_id}] Frame processing error: {str(e)}")
 
             elif "text" in msg and msg["text"] is not None:
+                # Handle text messages (heartbeat, control messages, etc.)
                 print(f"[{session_id}] Received text message: {msg['text']}")
-                # Handle heartbeats or control messages
+                
+                # Optional: Send acknowledgment
+                if msg["text"] == "ping":
+                    await ws.send_text("pong")
 
     except WebSocketDisconnect:
         print(f"[{session_id}] WebSocket disconnected gracefully.")
-    except ConnectionClosedError as e:
-        print(f"[{session_id}] Connection closed unexpectedly: {e}")
     except Exception as e:
-        print(f"[{session_id}] Error: {str(e)}")
+        print(f"[{session_id}] WebSocket error: {str(e)}")
     finally:
-        # Clean up
+        # Clean up session
         if session_id in frame_memory:
             del frame_memory[session_id]
         print(f"[{session_id}] Session cleaned up.")

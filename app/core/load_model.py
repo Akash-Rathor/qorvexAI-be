@@ -26,13 +26,13 @@ class ModelWrapper:
         self.device_type = self._detect_device()
         print(f"Using device: {self.device_type}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path,use_fast=True)
         self.processor = AutoProcessor.from_pretrained(self.model_path)
 
         try:
             if self.device_type == "mps":
                 self.device = torch.device("mps")
-                torch.backends.mps.enable_mps_fallback(True)
+                # torch.backends.mps.enable_mps_fallback(True)
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_path,
                     torch_dtype=torch.bfloat16,
@@ -56,6 +56,9 @@ class ModelWrapper:
                 self.model_path,
                 low_cpu_mem_usage=True
             )
+
+        finally:
+            return self
 
     def clear_cache(self):
         import torch

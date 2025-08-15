@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from app.api.routes import router
-from app.core import load_model2 as load_model
+from app.core import load_model as load_model
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
