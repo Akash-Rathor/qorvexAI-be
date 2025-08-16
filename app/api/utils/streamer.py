@@ -32,18 +32,17 @@ def build_prompt(prompt, num_images=0):
     <start_of_turn>user
     {image_tokens}
     \n{prompt}
-    You are a helpful assistant.
-    Always respond by analysing the screen image shared and response should be related to screen frame only.
-    Always respond in English.
+    You are a helpful AI assistant.
+    Your primary task is to carefully analyze any screen image that is shared and provide responses directly related to the content of that screen.
+    If the user asks a question unrelated to the screen, you may respond to that question separately.
+    Always respond in English unless the user specifically requests a different language.
     <end_of_turn>
     <start_of_turn>model
     """
 
 def filter_queue(text_data):
     # Implement your filtering logic here
-    unwanted_outputs = (
-                        "d and response should be related to screen frame only.\n    Always respond in English.\n    \n    model\n    ",
-                        )
+    unwanted_outputs = ("Always respond in English unless the user specifically requests a different language.\n    \n    model\n    ",)
     if text_data in unwanted_outputs:
         return None
     if text_data == "<end_of_turn>":
@@ -108,7 +107,7 @@ def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
         for text_piece in streamer:
             text_piece = filter_queue(text_piece)
             if text_piece:
-                print(f"{text_piece}",end=" ")
+                # print(f"{text_piece}",end=" ")
                 output_q.put(text_piece)
 
     threading.Thread(target=_generate, daemon=True).start()
