@@ -68,8 +68,8 @@ def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
                 new_q.put(f)
             frame_queue = new_q
 
-        while frame_queue is None or frame_queue.empty():
-            time.sleep(0.1)
+        # while frame_queue is None or frame_queue.empty():
+        #     time.sleep(0.1)
 
         # Process initial frames
         with frame_queue.mutex:

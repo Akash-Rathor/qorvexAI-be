@@ -123,7 +123,7 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
                             except Exception as e:
                                 output_q.put(f"[Generation Error]: {str(e)}")
 
-                        time.sleep(0.1)  # Adjust based on your needs
+                        # time.sleep(0.1)  # Adjust based on your needs
 
                 except Exception as e:
                     output_q.put(f"[Error during generation]: {str(e)}")
@@ -138,20 +138,20 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
             try:
                 while True:
                     try:
-                        token = output_q.get(timeout=30)
+                        token = output_q.get(timeout=10)
                         if token is None:
                             break
                         yield token  # SSE format
                         # yield f"data: {token}\n\n"  # SSE format
                     except queue.Empty:
                         stop_event.set()
-                        yield "\n[Stream timeout]"
+                        # yield "\n[Stream timeout]"
                         break
             except Exception as e:
                 stop_event.set()
                 yield f"\n[Stream error]: {str(e)}"
-            finally:
-                yield "\n[Completed]"
+            # finally:
+                # yield "\n[Completed]"
 
         return StreamingResponse(token_generator(), media_type="text/plain")
 
