@@ -56,7 +56,7 @@ def filter_queue(text_data):
 
     return text_data
 
-def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
+def generate_stream(model_obj, prompt, frame_queue=None, stop_event=None, max_new_tokens=256):
     output_q = queue.Queue()
 
     def _generate():
@@ -67,19 +67,9 @@ def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
                 new_q.put(f)
             frame_queue = new_q
 
-        # while frame_queue is None or frame_queue.empty():
-        #     time.sleep(0.1)
-
-        # Process initial frames
         with frame_queue.mutex:
             pil_imgs = list(frame_queue.queue)
-            # for f in list(frame_queue.queue):
-            #     if isinstance(f, np.ndarray):
-            #         pil_imgs.append(Image.fromarray(f))
-            #     elif isinstance(f, dict) and "frame" in f:
-            #         pil_imgs.append(Image.fromarray(f["frame"]))
 
-        # Prepare inputs
         pil_imgs = pil_imgs[-1:]
         prepared_prompt = build_prompt(prompt, num_images=len(pil_imgs))
         model_obj_input = model_obj.processor(
@@ -87,32 +77,33 @@ def generate_stream(model_obj, prompt, frame_queue=None, max_new_tokens=256):
             images=pil_imgs if pil_imgs else None,
             return_tensors="pt",
             padding=True
-        ).to(model_obj.device)  # FIX: move to MPS/CPU/CUDA
+        ).to(model_obj.device)
 
-        # Streaming setup
         streamer = TextIteratorStreamer(model_obj.processor.tokenizer, skip_special_tokens=True)
-        
-        # Run generation in thread
-        gen_thread = threading.Thread(
-            target=lambda: model_obj.model.generate(
+
+        def run_generation():
+            model_obj.model.generate(
                 **model_obj_input,
                 max_new_tokens=max_new_tokens,
                 streamer=streamer
-            ),
-            daemon=True
-        )
-        gen_thread.start()
+            )
 
-        # Yield streamed tokens
+        threading.Thread(target=run_generation, daemon=True).start()
+
         for text_piece in streamer:
+            if stop_event and stop_event.is_set():
+                break
             text_piece = filter_queue(text_piece)
             if text_piece:
-                # print(f"{text_piece}",end=" ")
                 output_q.put(text_piece)
+
+        output_q.put(None)
 
     threading.Thread(target=_generate, daemon=True).start()
 
     while True:
+        if stop_event and stop_event.is_set():
+            break
         token = output_q.get()
         if token is None:
             break

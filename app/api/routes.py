@@ -79,79 +79,37 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
                     break
 
         def token_generator():
+            stop_event = frame_memory[session_id]["stop_event"]
             output_q = queue.Queue()
-            stop_event = threading.Event()
 
             def _generate():
                 try:
-                    # Initial generation with current frames
                     pil_imgs = []
                     if frames:
                         for f in frames:
                             if isinstance(f, np.ndarray):
                                 pil_imgs.append(Image.fromarray(f))
 
-                    # Generate initial response
-                    for token in generate_stream(model,prompt, frame_queue=pil_imgs):
+                    # Generate tokens
+                    for token in generate_stream(model, prompt, frame_queue=pil_imgs, stop_event=stop_event):
                         if stop_event.is_set():
                             break
                         output_q.put(token)
 
-                    # Continue processing new frames
-                    while not stop_event.is_set():
-                        if session_id not in frame_memory:
-                            break
-
-                        # Get new frames safely
-                        latest_frames = []
-                        q_local = frame_memory[session_id]["queue"]
-                        with frame_memory[session_id]["lock"]:
-                            try:
-                                while not q_local.empty():
-                                    f = q_local.get_nowait()
-                                    latest_frames.append(f["frame"] if isinstance(f, dict) else f)
-                            except queue.Empty:
-                                pass
-
-                        if latest_frames:
-                            pil_imgs = [Image.fromarray(f) for f in latest_frames]
-                            try:
-                                for token in generate_stream(model,prompt, frame_queue=pil_imgs):
-                                    if stop_event.is_set():
-                                        break
-                                    output_q.put(token)
-                            except Exception as e:
-                                output_q.put(f"[Generation Error]: {str(e)}")
-
-                        # time.sleep(0.1)  # Adjust based on your needs
-
                 except Exception as e:
                     output_q.put(f"[Error during generation]: {str(e)}")
                 finally:
-                    output_q.put(None)  # Signal end of stream
+                    # Signal end of stream
+                    output_q.put(None)
 
-            # Start generation thread
-            generation_thread = threading.Thread(target=_generate, daemon=True)
-            generation_thread.start()
+            threading.Thread(target=_generate, daemon=True).start()
 
-            # Stream tokens
-            try:
-                while True:
-                    try:
-                        token = output_q.get(timeout=10)
-                        if token is None:
-                            break
-                        yield token  # SSE format
-                        # yield f"data: {token}\n\n"  # SSE format
-                    except queue.Empty:
-                        stop_event.set()
-                        # yield "\n[Stream timeout]"
-                        break
-            except Exception as e:
-                stop_event.set()
-                yield f"\n[Stream error]: {str(e)}"
-            # finally:
-                # yield "\n[Completed]"
+            while True:
+                token = output_q.get()
+                if token is None or stop_event.is_set():
+                    break
+                yield token
+
 
         return StreamingResponse(token_generator(), media_type="text/plain")
 
@@ -168,7 +126,8 @@ async def stream_frame(ws: WebSocket, session_id: str):
     # Initialize session memory
     frame_memory.setdefault(session_id, {
         "queue": queue.Queue(maxsize=MAX_FRAMES),
-        "lock": threading.Lock()
+        "lock": threading.Lock(),
+        "stop_event": threading.Event()
     })
 
     print(f"[{session_id}] WebSocket connection established.")
@@ -238,8 +197,14 @@ async def clear_session(request: SessionIdManager, access=Depends(access_model_i
     running_gens = access["sessions"]
     frame_memory = access["frame_memory"]
 
+    if session_id in frame_memory:
+        stop_event = frame_memory[session_id].get("stop_event")
+        if stop_event:
+            stop_event.set()
+
     session_memory.pop(session_id, None)
     running_gens.pop(session_id, None)
     frame_memory.pop(session_id, None)
 
     return Response(f"{session_id} Deleted Successfully", status_code=200)
+
