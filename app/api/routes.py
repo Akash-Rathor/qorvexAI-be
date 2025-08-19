@@ -3,8 +3,6 @@ from .models.base import PredictRequest, SessionIdManager
 from .dependencies.inject_model import access_model_instance
 from fastapi.responses import StreamingResponse, Response,JSONResponse
 import threading, cv2, time
-from .utils.core import truncate_history, build_prompt
-from .utils.streamer import generate_stream,frame_memory
 import numpy as np
 import queue
 from PIL import Image
@@ -13,44 +11,11 @@ from websockets import ConnectionClosedError
 
 router = APIRouter()
 
-MAX_FRAMES = 10  # FIFO max frames
-
 
 @router.get("/ping")
 def ping():
     return {"status": "ok"}
 
-
-# @router.post("/generate")
-#  # this function is to work with guff
-# async def generate(request: PredictRequest, access=Depends(access_model_instance)):
-#     session_id = request.session_id
-#     prompt = request.prompt
-#     model = access.get("model", "")
-
-#     if not session_id or session_id not in frame_memory:
-#         return JSONResponse({"error": "Invalid session_id or session not active"}, status_code=400)
-
-#     q = frame_memory[session_id]["queue"]
-
-#     # Collect frames safely
-#     frames = []
-#     with frame_memory[session_id]["lock"]:
-#         while not q.empty():
-#             frame_info = q.get()
-#             frames.append(frame_info["frame"] if isinstance(frame_info, dict) else frame_info)
-
-#     if not frames:
-#         print(f"[Session {session_id}] No frames available in queue")
-#         return JSONResponse({"error": "No frames to process"}, status_code=400)
-
-#     print(f"Generate called with session_id: {session_id}, frames collected: {len(frames[-3:])}")
-
-#     def token_generator():
-#         for token in generate_stream(model, prompt, frame_queue=frames[-3:]):
-#             yield token
-
-#     return StreamingResponse(token_generator(), media_type="text/plain")
 
 @router.post("/generate")
 async def generate(request: PredictRequest, access=Depends(access_model_instance)):
@@ -58,17 +23,16 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
         session_id = request.session_id
         prompt = request.prompt
         max_tokens = request.max_tokens
-        access_model = access.get("model")
-        model = access_model
+        access_model_obj = access.get("model")
 
-        if not session_id or session_id not in frame_memory:
+        if not session_id or session_id not in access_model_obj.frame_memory:
             return JSONResponse({"error": "Invalid session_id or session not active"}, status_code=400)
 
-        q = frame_memory[session_id]["queue"]
+        q = access_model_obj.frame_memory[session_id]["queue"]
 
         # Safely collect latest frames
         frames = []
-        with frame_memory[session_id]["lock"]:
+        with access_model_obj.frame_memory[session_id]["lock"]:
             frame_count = 0
             while not q.empty() and frame_count < 3:
                 try:
@@ -79,7 +43,7 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
                     break
 
         def token_generator():
-            stop_event = frame_memory[session_id]["stop_event"]
+            stop_event = access_model_obj.frame_memory[session_id]["stop_event"]
             output_q = queue.Queue()
 
             def _generate():
@@ -91,7 +55,7 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
                                 pil_imgs.append(Image.fromarray(f))
 
                     # Generate tokens
-                    for token in generate_stream(model, prompt, frame_queue=pil_imgs, stop_event=stop_event):
+                    for token in access_model_obj.generate_stream(access_model_obj, prompt, frame_queue=pil_imgs, stop_event=stop_event):
                         if stop_event.is_set():
                             break
                         output_q.put(token)
@@ -99,16 +63,21 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
                 except Exception as e:
                     output_q.put(f"[Error during generation]: {str(e)}")
                 finally:
-                    # Signal end of stream
-                    output_q.put(None)
+                    output_q.put(None)  # Sentinel
 
             threading.Thread(target=_generate, daemon=True).start()
 
-            while True:
-                token = output_q.get()
-                if token is None or stop_event.is_set():
+            while not stop_event.is_set():
+                try:
+                    token = output_q.get(timeout=0.5)  # check every 500ms
+                except queue.Empty:
+                    continue  # no token yet, loop again
+
+                if token is None:  # sentinel -> end of stream
                     break
+
                 yield token
+
 
 
         return StreamingResponse(token_generator(), media_type="text/plain")
@@ -122,10 +91,11 @@ async def generate(request: PredictRequest, access=Depends(access_model_instance
 async def stream_frame(ws: WebSocket, session_id: str):
     session_id = session_id.strip()
     await ws.accept()
-    
+
+    access_model_obj = ws.app.state.model_instance
     # Initialize session memory
-    frame_memory.setdefault(session_id, {
-        "queue": queue.Queue(maxsize=MAX_FRAMES),
+    access_model_obj.frame_memory.setdefault(session_id, {
+        "queue": queue.Queue(maxsize=Config().MAX_FRAMES),
         "lock": threading.Lock(),
         "stop_event": threading.Event()
     })
@@ -157,8 +127,8 @@ async def stream_frame(ws: WebSocket, session_id: str):
                     frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
                     # Store frame safely
-                    q = frame_memory[session_id]["queue"]
-                    with frame_memory[session_id]["lock"]:
+                    q = access_model_obj.frame_memory[session_id]["queue"]
+                    with access_model_obj.frame_memory[session_id]["lock"]:
                         if q.full():
                             # Remove oldest frame if queue is full
                             try:
@@ -184,8 +154,8 @@ async def stream_frame(ws: WebSocket, session_id: str):
         print(f"[{session_id}] WebSocket error: {str(e)}")
     finally:
         # Clean up session
-        if session_id in frame_memory:
-            del frame_memory[session_id]
+        if session_id in access_model_obj.frame_memory:
+            del access_model_obj.frame_memory[session_id]
         print(f"[{session_id}] Session cleaned up.")
 
 

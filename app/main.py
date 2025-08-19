@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.model_instance = load_model.ModelWrapper().load()
+    model_path = "models/gemma"
+    app.state.model_instance = load_model.ModelWrapper(model_path).load()
     app.state.running_generations = {}
     app.state.session_memory = {}
     app.state.frame_memory = {}
